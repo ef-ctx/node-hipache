@@ -2,7 +2,7 @@
 'use strict';
 
 var fs = require('fs'),
-    readInstalled = require('read-installed'),
+    path = require('path'),
     util = require('util'),
     http = require('http'),
     https = require('https'),
@@ -12,10 +12,7 @@ var fs = require('fs'),
 
 var rootDir = fs.realpathSync(__dirname + '/../');
 
-var versions = {};
-readInstalled(rootDir, null, null, function(err, data) {
-    versions[data.name] = data.version;
-});
+var hipacheVersion = require(path.join(__dirname, '..', 'package.json')).version;
 
 var logType = {
     log: 1,
@@ -65,12 +62,25 @@ function Worker(config) {
         logHandler: log,
         debugHandler: debug
     });
-    this.runServer(config.server);
+    this.config = config;
 }
 
-Worker.prototype.runServer = function (config) {
-    httpProxy.setMaxSockets(config.maxSockets);
+Worker.prototype.run = function () {
+    this.runServer(this.config.server);
+};
 
+Worker.prototype.runServer = function (config) {
+    var options = {};
+    if (config.httpKeepAlive !== true) {
+        // Disable the http Agent of the http-proxy library so we force
+        // the proxy to close the connection after each request to the backend
+        options.agent = false;
+    }
+    var proxy = httpProxy.createProxyServer(options);
+    http.globalAgent.maxSockets = config.maxSockets;
+    https.globalAgent.maxSockets = config.maxSockets;
+
+    // Handler called when an error is triggered while proxying a request
     var proxyErrorHandler = function (err, req, res) {
         if (err.code === 'ECONNREFUSED' ||
                 err.code === 'ETIMEDOUT' ||
@@ -85,9 +95,11 @@ Worker.prototype.runServer = function (config) {
                 // Clearing the error
                 delete req.error;
             }
-            log(req.headers.host + ': backend #' + backendId + ' is dead (' + JSON.stringify(err) + ') while handling request for ' + req.url);
+            log(req.headers.host + ': backend #' + backendId + ' is dead (' + JSON.stringify(err) +
+                ') while handling request for ' + req.url);
         } else {
-            log(req.headers.host + ': backend #' + req.meta.backendId + ' reported an error (' + JSON.stringify(err) + ') while handling request for ' + req.url);
+            log(req.headers.host + ': backend #' + req.meta.backendId + ' reported an error (' +
+                JSON.stringify(err) + ') while handling request for ' + req.url);
         }
         req.retries = (req.retries === undefined) ? 0 : req.retries + 1;
         if (!res.connection || res.connection.destroyed === true) {
@@ -114,6 +126,7 @@ Worker.prototype.runServer = function (config) {
         req.emit('retry');
     }.bind(this);
 
+    // Handler called at the begining of the proxying
     var startHandler = function (req, res) {
         var remoteAddr = getRemoteAddress(req);
 
@@ -187,7 +200,7 @@ Worker.prototype.runServer = function (config) {
             };
             if (res.debug === true) {
                 headers['x-debug-error'] = message;
-                headers['x-debug-version-hipache'] = versions.hipache;
+                headers['x-debug-version-hipache'] = hipacheVersion;
             }
             res.writeHead(code, headers);
             stream.on('data', function (data) {
@@ -211,7 +224,7 @@ Worker.prototype.runServer = function (config) {
             };
             if (res.debug === true) {
                 headers['x-debug-error'] = message;
-                headers['x-debug-version-hipache'] = versions.hipache;
+                headers['x-debug-version-hipache'] = hipacheVersion;
             }
             res.writeHead(code, headers);
             res.write(message);
@@ -237,19 +250,6 @@ Worker.prototype.runServer = function (config) {
                 return serveText();
             });
         });
-    };
-
-    var getDomainName = function (hostname) {
-        var idx = hostname.lastIndexOf('.');
-
-        if (idx < 0) {
-            return hostname;
-        }
-        idx = hostname.lastIndexOf('.', idx - 1);
-        if (idx < 0) {
-            return hostname;
-        }
-        return hostname.substr(idx);
     };
 
     var httpRequestHandler = function (req, res) {
@@ -305,7 +305,7 @@ Worker.prototype.runServer = function (config) {
                 }
                 // If debug is enabled, let's inject the debug headers
                 if (res.debug === true) {
-                    res.setHeader('x-debug-version-hipache', versions.hipache);
+                    res.setHeader('x-debug-version-hipache', hipacheVersion);
                     res.setHeader('x-debug-backend-url', req.meta.backendUrl);
                     res.setHeader('x-debug-backend-id', req.meta.backendId);
                     res.setHeader('x-debug-vhost', req.meta.virtualHost);
@@ -320,7 +320,7 @@ Worker.prototype.runServer = function (config) {
             res.end = function () {
                 resEnd.apply(res, arguments);
                 // Number of bytes written on the client socket
-                var socketBytesWritten = req.connection ? req.connection._bytesDispatched : 0;
+                var socketBytesWritten = req.connection ? req.connection.bytesWritten : 0;
                 if (req.meta === undefined ||
                         req.headers['x-real-ip'] === undefined) {
                     return; // Nothing to log
@@ -346,8 +346,6 @@ Worker.prototype.runServer = function (config) {
 
         // Proxy the HTTP request
         var proxyRequest = function () {
-            var buffer = httpProxy.buffer(req);
-
             this.cache.getBackendFromHostHeader(req.headers.host, function (err, code, backend) {
                 if (err) {
                     return errorMessage(res, err, code);
@@ -361,20 +359,17 @@ Worker.prototype.runServer = function (config) {
                 };
                 // Proxy the request to the backend
                 res.timer.startBackend = Date.now();
-                var proxy = new httpProxy.HttpProxy({
+                proxy.emit('start', req, res);
+                proxy.web(req, res, {
                     target: {
                         host: backend.hostname,
                         port: backend.port
                     },
-                    enable: {
-                        xforward: false
-                    }
+                    xfwd: false
                 });
-                proxy.on('proxyError', proxyErrorHandler);
-                proxy.on('start', startHandler);
-                proxy.proxyRequest(req, res, buffer);
             });
         }.bind(this);
+        // Configure the retryOnError
         if (config.retryOnError) {
             req.on('retry', function () {
                 log('Retrying on ' + req.headers.host);
@@ -385,23 +380,18 @@ Worker.prototype.runServer = function (config) {
     }.bind(this);
 
     var wsRequestHandler = function (req, socket, head) {
-        var buffer = httpProxy.buffer(socket);
-
         this.cache.getBackendFromHostHeader(req.headers.host, function (err, code, backend) {
-            var proxy;
-
             if (err) {
                 log('proxyWebSocketRequest: ' + err);
                 return;
             }
             // Proxy the WebSocket request to the backend
-            proxy = new httpProxy.HttpProxy({
+            proxy.ws(req, socket, head, {
                 target: {
                     host: backend.hostname,
                     port: backend.port
                 }
             });
-            proxy.proxyWebSocketRequest(req, socket, head, buffer);
         });
     }.bind(this);
 
@@ -419,7 +409,7 @@ Worker.prototype.runServer = function (config) {
             return JSON.stringify({
                 remoteAddress: remoteAddress,
                 remotePort: remotePort,
-                bytesWritten: connection._bytesDispatched,
+                bytesWritten: connection.bytesWritten,
                 bytesRead: connection.bytesRead,
                 elapsed: (Date.now() - start) / 1000
             });
@@ -436,104 +426,63 @@ Worker.prototype.runServer = function (config) {
         });
     };
 
-    if (config.httpKeepAlive !== true) {
-        // Disable the http Agent of the http-proxy library so we force
-        // the proxy to close the connection after each request to the backend
-        httpProxy._getAgent = function () {
-            return false;
-        };
-    }
+    // Set proxy handlers
+    proxy.on('error', proxyErrorHandler);
+    proxy.on('start', startHandler);
 
-    // Ipv4
-    if (config.address) {
-        var length = config.address.length, 
-                     address = null;
-        for (var i = 0; i < length; i++) {
-            var ipv4HttpServer = http.createServer(httpRequestHandler);
-            ipv4HttpServer.on('connection', tcpConnectionHandler);
-            ipv4HttpServer.on('upgrade', wsRequestHandler);
-            ipv4HttpServer.listen(config.port, config.address[i]);
-            
-            monitor.addServer(ipv4HttpServer);
+    //http
+    (function () {
+        var httpServer;
+
+        if (config.address) {
+            var length = config.address.length;
+            for (var i = 0; i < length; i++) {
+                httpServer = http.createServer(httpRequestHandler);
+                httpServer.on('connection', tcpConnectionHandler);
+                httpServer.on('upgrade', wsRequestHandler);
+                httpServer.listen(config.port, config.address[i]);
+                monitor.addServer(httpServer);
+            }
+            return;
         }
-    } else {
-         var ipv4HttpServer = http.createServer(httpRequestHandler);
-         ipv4HttpServer.on('connection', tcpConnectionHandler);
-         ipv4HttpServer.on('upgrade', wsRequestHandler);
-         ipv4HttpServer.listen(config.port);
-         
-         monitor.addServer(ipv4HttpServer);
-    }
-
-    // Ipv6
-    if (config.address6) {
-        var length = config.address6.length, 
-                     address6 = null;
-        for (var i = 0; i < length; i++) {
-            var ipv6HttpServer = http.createServer(httpRequestHandler);
-            ipv6HttpServer.on('connection', tcpConnectionHandler);
-            ipv6HttpServer.on('upgrade', wsRequestHandler);
-            ipv6HttpServer.listen(config.port, config.address6[i]);
-            
-            monitor.addServer(ipv6HttpServer);
-        }        
-    } else {
-        var ipv6HttpServer = http.createServer(httpRequestHandler);
-        ipv6HttpServer.on('connection', tcpConnectionHandler);
-        ipv6HttpServer.on('upgrade', wsRequestHandler);
-        ipv6HttpServer.listen(config.port, '::1');
-        
-        monitor.addServer(ipv6HttpServer);
-    }
+        httpServer = http.createServer(httpRequestHandler);
+        httpServer.on('connection', tcpConnectionHandler);
+        httpServer.on('upgrade', wsRequestHandler);
+        httpServer.listen(config.port, '::');
+        monitor.addServer(httpServer);
+    })();
 
     //https
-    if (config.https) {
-        var options = config.https;
+    (function () {
+        if (!config.https) {
+            return;
+        }
+
+        var httpsServer,
+            i,
+            length,
+            options = config.https;
         options.key = fs.readFileSync(options.key, 'utf8');
         options.cert = fs.readFileSync(options.cert, 'utf8');
-        
-        //https ipv4
+
         if (config.address) {
-            var length = config.address.length, 
-                         address = null;
-            for (var i = 0; i < length; i++) {
-                var ipv4HttpsServer = https.createServer(options, httpRequestHandler);
-                ipv4HttpsServer.on('connection', tcpConnectionHandler);
-                ipv4HttpsServer.on('upgrade', wsRequestHandler);
-                ipv4HttpsServer.listen(config.https.port, config.address[i]);
-            
-                monitor.addServer(ipv4HttpsServer);
+            length = config.address.length;
+            for (i = 0; i < length; i++) {
+                httpsServer = https.createServer(options, httpRequestHandler);
+                httpsServer.on('connection', tcpConnectionHandler);
+                httpsServer.on('upgrade', wsRequestHandler);
+                httpsServer.listen(config.https.port, config.address[i]);
+                monitor.addServer(httpsServer);
             }
         } else {
-            var ipv4HttpsServer = https.createServer(options, httpRequestHandler);
-            ipv4HttpsServer.on('connection', tcpConnectionHandler);
-            ipv4HttpsServer.on('upgrade', wsRequestHandler);
-            ipv4HttpsServer.listen(config.https.port);
+            httpsServer = https.createServer(options, httpRequestHandler);
+            httpsServer.on('connection', tcpConnectionHandler);
+            httpsServer.on('upgrade', wsRequestHandler);
+            httpsServer.listen(config.https.port, '::');
 
-            monitor.addServer(ipv4HttpsServer);
+            monitor.addServer(httpsServer);
         }
-        
-        //https ipv6
-        if (config.address6) {
-            var length = config.address6.length, 
-                         address6 = null;
-            for (var i = 0; i < length; i++) {
-                var ipv6HttpsServer = https.createServer(options, httpRequestHandler);
-                ipv6HttpsServer.on('connection', tcpConnectionHandler);
-                ipv6HttpsServer.on('upgrade', wsRequestHandler);
-                ipv6HttpsServer.listen(config.https.port, config.address6[i]);
-            
-                monitor.addServer(ipv6HttpsServer);
-            }        
-        } else {
-            var ipv6HttpsServer = https.createServer(options, httpRequestHandler);
-            ipv6HttpsServer.on('connection', tcpConnectionHandler);
-            ipv6HttpsServer.on('upgrade', wsRequestHandler);
-            ipv6HttpsServer.listen(config.https.port, '::1');
-            
-            monitor.addServer(ipv6HttpsServer);
-        }
-    }
+    })();
 };
 
 module.exports = Worker;
